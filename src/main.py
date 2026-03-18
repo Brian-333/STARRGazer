@@ -1,5 +1,9 @@
 from ultralytics import YOLO
 import cv2
+from pathlib import Path
+
+SRC_DIR = Path(__file__).parent
+MODEL_PATH = SRC_DIR / 'best.pt'
 
 # 1. Load the pre-trained YOLOv11 model (nano version for speed)
 model = YOLO('best.pt') 
