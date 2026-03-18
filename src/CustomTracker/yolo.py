@@ -7,7 +7,7 @@ class YOLOTracker:
         # Load the pre-trained YOLOv11 model
         self.model = YOLO(model_path)
 
-    def track(self, video_source=0) -> list:
+    def predict(self, video_source=0, device='cuda:0') -> list:
 
         # Open the webcam (0 is usually the default camera)
         cap = cv2.VideoCapture(video_source)
@@ -19,7 +19,7 @@ class YOLOTracker:
                 break
 
             # Run YOLOv11 inference on the frame
-            results = self.model(frame)
+            results = self.model.predict(frame, device=device, stream=True, show_conf=True)
 
             # Visualize the results on the frame
             annotated_frame = results[0].plot()

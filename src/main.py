@@ -6,7 +6,7 @@ MODEL_PATH = SRC_DIR / 'best.pt'
 
 def main():
     new_tracker = CustomTracker.yolo.YOLOTracker(MODEL_PATH)
-    new_tracker.track()
+    result = new_tracker.predict()
 
 
 if __name__ == "__main__":
