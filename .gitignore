@@ -1,3 +1,6 @@
+# MacOS
+.DS_Store
+
 # Weight files
 *.pt
 *.onnx
