@@ -64,20 +64,24 @@ pan_pid = PID(4.0, 0.2, 0.35, integral_limit=np.deg2rad(20), output_limit=np.deg
 tilt_pid = PID(4.0, 0.2, 0.35, integral_limit=np.deg2rad(20), output_limit=np.deg2rad(180))
 
 pan, tilt = 0.0, 0.0
+fps = 0.0
+fps_smoothing = 0.9
 
 last_time = time.time()
 
 # -----------------------
 # Tracker (CSRT)
 # -----------------------
-tracker = cv2.legacy.TrackerKCF_create()
+tracker = cv2.TrackerKCF_create()
 initBB = None
 
 # -----------------------
 # Main loop
 # -----------------------
+cap.set(cv2.CAP_PROP_FPS, 30)
 while True:
     ret, frame = cap.read()
+    # frame = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
     if not ret:
         break
 
@@ -85,6 +89,9 @@ while True:
     dt = now - last_time
     dt = np.clip(dt, 1e-3, 0.1)
     last_time = now
+
+    current_fps = 1.0 / dt
+    fps = fps_smoothing * fps + (1 - fps_smoothing) * current_fps
 
     # Select object manually
     if initBB is None:
@@ -148,6 +155,9 @@ while True:
         else:
             cv2.putText(frame, "Tracking lost", (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+    cv2.putText(frame, f"FPS: {fps:.1f}", (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
     cv2.imshow("Tracking", frame)
 
