@@ -14,7 +14,7 @@ def main():
     # -------------------------------
     # Load YOLOv11 model
     # -------------------------------
-    model = YOLO("yolo11n.pt")  # or your custom model
+    model = YOLO("yolo11n.pt")
 
     # -------------------------------
     # Initialize DeepSORT
