@@ -14,7 +14,7 @@ height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 cx, cy = width // 2, height // 2
 
 # Constants for conversion (these would need to be calibrated for your specific setup)
-KNOWN_WIDTH = 0.15  # meters (width of the object being tracked)
+KNOWN_WIDTH = 0.10  # meters (width of the object being tracked)
 FOCAL_LENGTH = 700  # pixels (this would need to be calibrated)
 
 prev_center = None
