@@ -22,6 +22,8 @@ MOTOR_SMOOTHING = 0.25
 TRACKING_GAIN = 3.0
 fps_smoothing = 0.9
 
+YOLO_RESIZE = (640, 360)
+
 class SimpleBBox:
     """Wrapper for MOSSE bounding box to match track interface."""
     def __init__(self, bbox):
@@ -234,6 +236,7 @@ class RocketTracker:
         fps = 0.0
 
         ret, frame1 = cap.read()
+        frame1 = cv2.resize(frame1, YOLO_RESIZE)  # Resize for consistent processing
         if not ret:
             return
         
@@ -279,6 +282,7 @@ class RocketTracker:
 
         while True:
             ret, frame = cap.read()
+            frame = cv2.resize(frame, YOLO_RESIZE)  # Resize for consistent processing
             if not ret:
                 break
 
@@ -307,7 +311,6 @@ class RocketTracker:
                 for track in self.tracker.tracks:
                     if track.track_id != self.id_to_track:
                         continue
-                    print(f"Updating MOSSE with new detection for track ID {self.id_to_track}")
                     target_exists = True
                     x1, y1, x2, y2 = map(int, track.to_tlbr())
                     self._init_mosse(frame, (x1, y1, x2, y2))
@@ -332,7 +335,8 @@ class RocketTracker:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        cap.release()
         self.motors.move(0, 0)
+        cap.release()
+        time.sleep(0.5)  # Ensure motors receive stop command before closing
         self.motors.close()
         cv2.destroyAllWindows()
