@@ -12,6 +12,12 @@ from HostMotorController.motor import SerialMotorController
 
 from PID import PID
 
+try:
+    from cv2 import legacy
+    MOSSE_AVAILABLE = True
+except ImportError:
+    MOSSE_AVAILABLE = False
+
 FOV_X = np.deg2rad(50)
 FOV_Y = np.deg2rad(34)
 
@@ -39,6 +45,10 @@ class RocketTracker:
         self.id_to_track = None
         self.filtered_pan_freq = 0.0
         self.filtered_tilt_freq = 0.0
+        
+        # MOSSE tracker for intermediate frames
+        self.mosse_trackers = {}  # Maps track_id to (mosse_tracker, last_bbox)
+        self.last_yolo_frame = None
 
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
@@ -59,6 +69,82 @@ class RocketTracker:
             self.filtered_tilt_freq = 0.0
 
         self.motors.move(self.filtered_pan_freq, self.filtered_tilt_freq)
+
+    def _initialize_mosse_trackers(self, frame, tracks):
+        """Initialize or reinitialize MOSSE trackers based on current tracks."""
+        if not MOSSE_AVAILABLE:
+            return
+        
+        current_track_ids = {track.track_id for track in tracks}
+        
+        # Remove MOSSE trackers for tracks that no longer exist
+        self.mosse_trackers = {
+            tid: tracker_data for tid, tracker_data in self.mosse_trackers.items()
+            if tid in current_track_ids
+        }
+        
+        # Initialize MOSSE trackers for new tracks
+        for track in tracks:
+            if track.track_id not in self.mosse_trackers and track.time_since_update <= 1:
+                try:
+                    x1, y1, x2, y2 = map(int, track.to_tlbr())
+                    bbox = (x1, y1, x2 - x1, y2 - y1)  # Convert to OpenCV format (x, y, w, h)
+                    
+                    mosse = legacy.TrackerMOSSE_create()
+                    mosse.init(frame, bbox)
+                    self.mosse_trackers[track.track_id] = {
+                        'tracker': mosse,
+                        'bbox': bbox
+                    }
+                except Exception as e:
+                    print(f"Failed to initialize MOSSE for track {track.track_id}: {e}")
+
+    def _update_mosse_trackers(self, frame):
+        """Update MOSSE trackers and return detections."""
+        if not MOSSE_AVAILABLE or not self.mosse_trackers:
+            return []
+        
+        mosse_detections = []
+        failed_tracks = []
+        
+        for track_id, tracker_data in self.mosse_trackers.items():
+            try:
+                success, bbox = tracker_data['tracker'].update(frame)
+                
+                if success:
+                    x, y, w, h = bbox
+                    mosse_detections.append({
+                        'track_id': track_id,
+                        'bbox': [x, y, w, h],
+                        'xyxy': [x, y, x + w, y + h]
+                    })
+                    self.mosse_trackers[track_id]['bbox'] = bbox
+                else:
+                    failed_tracks.append(track_id)
+            except Exception as e:
+                print(f"MOSSE update failed for track {track_id}: {e}")
+                failed_tracks.append(track_id)
+        
+        # Remove failed trackers
+        for track_id in failed_tracks:
+            del self.mosse_trackers[track_id]
+        
+        return mosse_detections
+
+    def _detections_from_mosse(self, frame, mosse_detections):
+        """Convert MOSSE-tracked bboxes to Detection objects for deep_sort."""
+        if not mosse_detections:
+            return []
+        
+        bboxes = [det['bbox'] for det in mosse_detections]
+        features = self.encoder(frame, bboxes)
+        
+        detections = [
+            Detection(bbox, 0.95, feature)  # Use high confidence for MOSSE tracks
+            for bbox, feature in zip(bboxes, features)
+        ]
+        
+        return detections
 
     def _get_detections(self, frame):
         bboxes = []
@@ -207,11 +293,21 @@ class RocketTracker:
 
             self.tracker.predict()
             frame_count += 1
+            
+            # Use YOLO on regular intervals, MOSSE on skipped frames
             if frame_count % frames_to_skip == 0:
                 detections = self._get_detections(frame)
-
                 self.tracker.update(detections)
+                
+                # Initialize/update MOSSE trackers based on YOLO detections
+                self._initialize_mosse_trackers(frame, self.tracker.tracks)
                 frame_count = 0
+            else:
+                # Use MOSSE tracker on intermediate frames
+                mosse_detections = self._update_mosse_trackers(frame)
+                if mosse_detections:
+                    mosse_detections_obj = self._detections_from_mosse(frame, mosse_detections)
+                    self.tracker.update(mosse_detections_obj)
 
             target_exists = False
             for track in self.tracker.tracks:
