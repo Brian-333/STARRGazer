@@ -318,6 +318,12 @@ class RocketTracker:
                     break
             else:
                 self.tracker.predict()
+                if mosse_bbox is not None:
+                    mosse_w = mosse_bbox[2] - mosse_bbox[0]
+                    mosse_h = mosse_bbox[3] - mosse_bbox[1]
+                    mosse_bbox_det = [mosse_bbox[0], mosse_bbox[1], mosse_w, mosse_h]
+                    features = self.encoder(frame, [mosse_bbox_det])
+                    self.tracker.update([Detection(mosse_bbox_det, 1.0, features[0])])
 
             # Use MOSSE bbox for tracking and alignment
             target_exists = False
