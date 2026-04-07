@@ -1,21 +1,20 @@
-import CustomTracker.yolo
 from pathlib import Path
-import argparse
+from RocketTracker import RocketTracker
+from ultralytics import YOLO
+from deep_sort.tools import generate_detections as gdet
 
 SRC_DIR = Path(__file__).parent.resolve()
-MODEL_PATH = SRC_DIR / 'best.pt'
+MODEL_PATH = SRC_DIR / 'yolo26n.pt'
+ENCODER_MODEL_PATH = SRC_DIR / 'mars-small128.pb'
+
+MOTOR_PORT = "/dev/tty.usbmodem11101"
+MOTOR_BAUD = 115200
 
 def main():
-    args = argparse.ArgumentParser(description="Rocket Tracker")
-    args.add_argument('--device', type=str, default='cuda:0', help='Device to run the model on (e.g., "cuda:0", "cpu" or "mps")')
-    args.add_argument('--video_source', type=int, default=0, help='Video source (default is 0 for webcam)')
-    args.add_argument('--model_path', type=str, default=MODEL_PATH, help='Path to the YOLO model weights')
-    args.add_argument('--downsample_factor', type=int, default=2, help='Factor to downsample the input frames for faster processing')
-    args = args.parse_args()
-
-    new_tracker = CustomTracker.yolo.YOLOTracker(args.model_path, downsample_factor=args.downsample_factor)
-    result = new_tracker.predict(device=args.device)
-
+    yolo = YOLO(MODEL_PATH)
+    encoder = gdet.create_box_encoder(ENCODER_MODEL_PATH, batch_size=1)
+    tracker = RocketTracker(yolo, encoder, MOTOR_PORT, MOTOR_BAUD)
+    tracker.run(0)
 
 if __name__ == "__main__":
     main()
