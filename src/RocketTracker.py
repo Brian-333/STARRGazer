@@ -29,11 +29,11 @@ class RocketTracker:
         self.motors = SerialMotorController(motor_port, motor_baud)
         self.motors.run()
 
-        self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", 1.0, None)
+        self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", 1.5, None)
         self.tracker = Tracker(self.metric)
 
         self.pan_pid = PID(2.4, 0.08, 0.18, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
-        self.tilt_pid = PID(4.2, 0.20, 0.28, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
+        self.tilt_pid = PID(5.8, 0.28, 0.32, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
         self.pan, self.tilt = 0.0, 0.0
 
         self.id_to_track = None
@@ -202,6 +202,9 @@ class RocketTracker:
 
         last_time = time.time()
 
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+        video_out = cv2.VideoWriter('output.mp4', fourcc, 28.0, (frame1.shape[1], frame1.shape[0]))
+
         while True:
             ret, frame = cap.read()
             # frame = cv2.resize(frame, YOLO_RESIZE)
@@ -245,10 +248,14 @@ class RocketTracker:
 
             cv2.imshow("Rocket Tracker", frame)
 
+            video_out.write(frame)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        cap.release()
         self.motors.move(0, 0)
+        cap.release()
+        time.sleep(0.5)
+        video_out.release()
         self.motors.close()
         cv2.destroyAllWindows()
