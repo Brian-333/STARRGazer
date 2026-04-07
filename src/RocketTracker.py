@@ -64,7 +64,7 @@ class RocketTracker:
         bboxes = []
         scores = []
         # Classes = [0] for person only
-        results = self.model(frame, conf=0.25, device="mps", verbose=False)[0]
+        results = self.model(frame, conf=0.25, device="mps", verbose=False, classes=[0])[0]
         if results.boxes is not None:
             for box in results.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -180,7 +180,7 @@ class RocketTracker:
 
         print(f"Selected tracking ID: {self.id_to_track}")
 
-        frames_to_skip = 5
+        frames_to_skip = 1
         frame_count = 0
 
         last_time = time.time()
