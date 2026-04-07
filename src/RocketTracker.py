@@ -40,6 +40,14 @@ class RocketTracker:
         self.filtered_pan_freq = 0.0
         self.filtered_tilt_freq = 0.0
 
+        # New constants needed for tracking:
+        self.prev_center = None
+        self.prev_time = None
+        self.vx_smooth = 0.0
+        self.vy_smooth = 0.0
+        self.vel_alpha = 0.7
+        self.known_width = 0.15
+
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
         x_freq = (pan_rate / PAN_RATE_MAX) * common.MAX_FREQ
@@ -138,6 +146,72 @@ class RocketTracker:
         self.pan += pan_rate * dt
         self.tilt += tilt_rate * dt
         self._command_motors(pan_rate, tilt_rate)
+        # New: Now returning both rates to use in the velocity estimation
+        return pan_rate, tilt_rate
+
+    # ----------------------------------------------------------------
+    # New-untested velocity estimation
+    def _estimate_velocity(self, track, frame_shape, pan_rate, tilt_rate):
+        x1, y1, x2, y2 = map(int, track.to_tlbr())
+        obj_x = (x1 + x2) / 2.0
+        obj_y = (y1 + y2) / 2.0
+
+        current_time = time.time()
+        if self.prev_center is None:
+            self.prev_center = (obj_x, obj_y)
+            self.prev_time = current_time
+            return {
+                "vx_px": 0.0,
+                "vy_px": 0.0,
+                "speed_px": 0.0,
+                "speed_m": 0.0,
+                "pixel_to_meter": 0.0,
+            }
+
+        dt_vel = np.clip(current_time - self.prev_time, 1e-3, 1.0)
+        dx = obj_x - self.prev_center[0]
+        dy = obj_y - self.prev_center[1]
+
+        vx = dx / dt_vel
+        vy = dy / dt_vel
+
+        frame_height, frame_width = frame_shape[:2]
+        px_per_rad_x = frame_width / FOV_X
+        px_per_rad_y = frame_height / FOV_Y
+
+        cam_vx = pan_rate * px_per_rad_x
+        cam_vy = -tilt_rate * px_per_rad_y
+
+        vx_corrected = vx - cam_vx
+        vy_corrected = vy - cam_vy
+
+        self.vx_smooth = self.vel_alpha * self.vx_smooth + (1.0 - self.vel_alpha) * vx_corrected
+        self.vy_smooth = self.vel_alpha * self.vy_smooth + (1.0 - self.vel_alpha) * vy_corrected
+
+        speed_px = np.sqrt(self.vx_smooth**2 + self.vy_smooth**2)
+        width = float(x2 - x1)
+        pixel_to_meter = self.known_width / width if width > 0 else 0.0
+        vx_m = self.vx_smooth * pixel_to_meter
+        vy_m = self.vy_smooth * pixel_to_meter
+        speed_m = np.sqrt(vx_m**2 + vy_m**2)
+
+        self.prev_center = (obj_x, obj_y)
+        self.prev_time = current_time
+
+        return {
+            "vx_px": self.vx_smooth,
+            "vy_px": self.vy_smooth,
+            "speed_px": speed_px,
+            "speed_m": speed_m,
+            "pixel_to_meter": pixel_to_meter,
+        }
+    # New display of velocity
+    def _display_velocity(self, frame, velocity):
+        cv2.putText(frame, f"vx: {velocity['vx_px']:.1f} px/s", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"vy: {velocity['vy_px']:.1f} px/s", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"speed: {velocity['speed_px']:.1f} px/s", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Speed: {velocity['speed_m']:.2f} m/s", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"scale: {velocity['pixel_to_meter']:.4f} m/px", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     def run(self, camera_index=0):
         if self.motors is None:
@@ -220,9 +294,18 @@ class RocketTracker:
                 
                 target_exists = True
                 self._display_track(track, frame)
-                self._align_camera_to_track(track, frame.shape, dt)
+
+                # New velocity calls
+                pan_rate, tilt_rate = self._align_camera_to_track(track, frame.shape, dt)
+                velocity = self._estimate_velocity(track, frame.shape, pan_rate, tilt_rate)
+                self._display_velocity(frame, velocity)
                     
             if not target_exists:
+                # reset velocity constants
+                self.prev_center = None
+                self.prev_time = None
+                self.vx_smooth = 0.0
+                self.vy_smooth = 0.0
                 self.motors.move(0, 0)
 
             cv2.imshow("Rocket Tracker", frame)
