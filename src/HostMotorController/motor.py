@@ -7,7 +7,7 @@ Updated: 2026-04-06
 Author: Brian Lin
 """
 
-import common
+import HostMotorController.common as common
 import time
 import threading
 
@@ -96,7 +96,7 @@ class SerialMotorController:
 
 if __name__ == "__main__":
     multithreaded = True
-    device = "/dev/tty.usbmodem101"
+    device = "/dev/tty.usbmodem11101"
     baud_rate = 115200
     motors = SerialMotorController(device, baud_rate)
     commands = [
@@ -114,7 +114,7 @@ if __name__ == "__main__":
         if multithreaded:
             motors.move(*command)
         else:
-            motors.send_msg(f"{command[0]} {command[1]}\r\n".encode())
+            motors.send_msg(f"move {command[0]} {command[1]}\r\n".encode())
         time.sleep(1)
 
     if multithreaded:

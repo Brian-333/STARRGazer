@@ -18,7 +18,8 @@ FOV_Y = np.deg2rad(34)
 PAN_RATE_MAX = np.deg2rad(180)
 TILT_RATE_MAX = np.deg2rad(180)
 MOTOR_SMOOTHING = 0.25
-TRACKING_GAIN = 5.0
+TRACKING_GAIN = 3.0
+fps_smoothing = 0.9
 
 class RocketTracker:
     def __init__(self, model, encoder, motor_port, motor_baud):
@@ -63,7 +64,7 @@ class RocketTracker:
         bboxes = []
         scores = []
         # Classes = [0] for person only
-        results = self.model(frame, conf=0.25)[0]
+        results = self.model(frame, conf=0.25, device="mps", verbose=False)[0]
         if results.boxes is not None:
             for box in results.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -118,7 +119,7 @@ class RocketTracker:
         err_x = (target_x - frame_center_x) / (frame_width / 2)
         err_y = (frame_center_y - target_y) / (frame_height / 2)
         err_x = np.clip(err_x, -1.0, 1.0) * TRACKING_GAIN
-        err_y = np.clip(err_y, -1.0, 1.0) * TRACKING_GAIN * 2
+        err_y = np.clip(err_y, -1.0, 1.0) * TRACKING_GAIN 
 
         # Ignore tiny errors near image center to reduce jitter.
         deadzone = 0.05
@@ -144,6 +145,8 @@ class RocketTracker:
 
         cap = cv2.VideoCapture(camera_index)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        fps = 0.0
 
         ret, frame1 = cap.read()
         if not ret:
@@ -177,7 +180,7 @@ class RocketTracker:
 
         print(f"Selected tracking ID: {self.id_to_track}")
 
-        frames_to_skip = 1
+        frames_to_skip = 5
         frame_count = 0
 
         last_time = time.time()
@@ -189,10 +192,9 @@ class RocketTracker:
 
             now = time.time()
             dt = now - last_time
-            dt = np.clip(dt, 1e-3, 0.1)
             last_time = now
-
-            fps = 1.0 / dt if dt > 0 else float('inf')
+            current_fps = 1.0 / dt
+            fps = fps_smoothing * fps + (1 - fps_smoothing) * current_fps
             cv2.putText(
                 frame,
                 f"FPS: {fps:.2f}",
