@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import threading
 import time
+from collections import deque
 
 from deep_sort.deep_sort import nn_matching
 from deep_sort.deep_sort.detection import Detection
@@ -21,6 +22,15 @@ MOTOR_SMOOTHING = 0.25
 TRACKING_GAIN = 3.0
 fps_smoothing = 0.9
 
+class SimpleBBox:
+    """Wrapper for MOSSE bounding box to match track interface."""
+    def __init__(self, bbox):
+        self.bbox = bbox
+    
+    def to_tlbr(self):
+        """Return bounding box in top-left, bottom-right format."""
+        return self.bbox
+
 class RocketTracker:
     def __init__(self, model, encoder, motor_port, motor_baud):
         self.model = model
@@ -39,6 +49,13 @@ class RocketTracker:
         self.id_to_track = None
         self.filtered_pan_freq = 0.0
         self.filtered_tilt_freq = 0.0
+        
+        # MOSSE tracker for efficient frame-to-frame tracking
+        self.mosse = None
+        self.mosse_bbox = None
+        
+        # FPS tracking
+        self.fps_history = deque(maxlen=100)  # Keep last 100 FPS values
 
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
@@ -92,20 +109,88 @@ class RocketTracker:
     def _prompt_for_tracking_id(self):
         self.id_to_track = int(input("Enter the tracking ID: "))
 
+    def _init_mosse(self, frame, bbox):
+        """Initialize MOSSE tracker with initial bounding box."""
+        x1, y1, x2, y2 = map(int, bbox)
+        self.mosse = cv2.legacy.TrackerMOSSE_create()
+        self.mosse.init(frame, (x1, y1, x2 - x1, y2 - y1))
+        self.mosse_bbox = bbox
+
+    def _update_mosse(self, frame):
+        """Update MOSSE tracker and return new bounding box."""
+        if self.mosse is None:
+            return None
+        
+        success, bbox = self.mosse.update(frame)
+        if success:
+            x, y, w, h = bbox
+            self.mosse_bbox = (x, y, x + w, y + h)
+            return self.mosse_bbox
+        return None
+
+    def _draw_fps_plot(self, frame, fps):
+        """Draw FPS history plot on the frame."""
+        self.fps_history.append(fps)
+        
+        # Plot dimensions
+        plot_width = 200
+        plot_height = 100
+        plot_x = frame.shape[1] - plot_width - 10
+        plot_y = 10
+        
+        # Background
+        cv2.rectangle(frame, (plot_x, plot_y), (plot_x + plot_width, plot_y + plot_height), (0, 0, 0), -1)
+        cv2.rectangle(frame, (plot_x, plot_y), (plot_x + plot_width, plot_y + plot_height), (255, 255, 255), 1)
+        
+        # Draw grid lines
+        cv2.line(frame, (plot_x, plot_y + plot_height // 2), (plot_x + plot_width, plot_y + plot_height // 2), (100, 100, 100), 1)
+        
+        # Draw FPS values as line graph
+        if len(self.fps_history) > 1:
+            max_fps = 60  # Reference max FPS
+            for i in range(len(self.fps_history) - 1):
+                x1 = plot_x + int((i / len(self.fps_history)) * plot_width)
+                y1 = plot_y + plot_height - int((self.fps_history[i] / max_fps) * plot_height)
+                x2 = plot_x + int(((i + 1) / len(self.fps_history)) * plot_width)
+                y2 = plot_y + plot_height - int((self.fps_history[i + 1] / max_fps) * plot_height)
+                
+                # Clamp y values
+                y1 = np.clip(y1, plot_y, plot_y + plot_height)
+                y2 = np.clip(y2, plot_y, plot_y + plot_height)
+                
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        # Display current FPS and label
+        cv2.putText(frame, f"FPS: {fps:.1f}", (plot_x + 5, plot_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
     def _display_track(self, track, frame):
         x1, y1, x2, y2 = map(int, track.to_tlbr())
-        track_id = track.track_id
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(
-            frame,
-            f"ID: {track_id}",
-            (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-        )
+        
+        # Display track_id if available (from deep sort tracks)
+        if hasattr(track, 'track_id'):
+            track_id = track.track_id
+            cv2.putText(
+                frame,
+                f"ID: {track_id}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+            )
+        else:
+            # MOSSE tracker
+            cv2.putText(
+                frame,
+                f"ID: {self.id_to_track} (MOSSE)",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+            )
 
     def _align_camera_to_track(self, target_track, frame_shape, dt):
         frame_height, frame_width = frame_shape[:2]
@@ -180,7 +265,14 @@ class RocketTracker:
 
         print(f"Selected tracking ID: {self.id_to_track}")
 
-        frames_to_skip = 5
+        # Initialize MOSSE tracker with the selected target
+        for track in self.tracker.tracks:
+            if track.track_id == self.id_to_track:
+                x1, y1, x2, y2 = map(int, track.to_tlbr())
+                self._init_mosse(frame1, (x1, y1, x2, y2))
+                break
+
+        frames_to_skip = 10  # Run YOLO every 10 frames, use MOSSE for others
         frame_count = 0
 
         last_time = time.time()
@@ -195,32 +287,42 @@ class RocketTracker:
             last_time = now
             current_fps = 1.0 / dt
             fps = fps_smoothing * fps + (1 - fps_smoothing) * current_fps
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.2f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2,
-            )
+            
+            # Draw FPS plot on frame
+            self._draw_fps_plot(frame, current_fps)
 
-            self.tracker.predict()
+            # Update MOSSE tracker every frame
+            mosse_bbox = self._update_mosse(frame)
+            
+            # Run YOLO detections periodically
             frame_count += 1
             if frame_count % frames_to_skip == 0:
+                self.tracker.predict()
                 detections = self._get_detections(frame)
-
                 self.tracker.update(detections)
                 frame_count = 0
 
+                # Update MOSSE with new detection from YOLO
+                target_exists = False
+                for track in self.tracker.tracks:
+                    if track.track_id != self.id_to_track:
+                        continue
+                    print(f"Updating MOSSE with new detection for track ID {self.id_to_track}")
+                    target_exists = True
+                    x1, y1, x2, y2 = map(int, track.to_tlbr())
+                    self._init_mosse(frame, (x1, y1, x2, y2))
+                    mosse_bbox = (x1, y1, x2, y2)
+                    break
+            else:
+                self.tracker.predict()
+
+            # Use MOSSE bbox for tracking and alignment
             target_exists = False
-            for track in self.tracker.tracks:
-                if track.track_id != self.id_to_track:
-                    continue
-                
+            if mosse_bbox is not None:
                 target_exists = True
-                self._display_track(track, frame)
-                self._align_camera_to_track(track, frame.shape, dt)
+                mosse_track = SimpleBBox(mosse_bbox)
+                self._display_track(mosse_track, frame)
+                self._align_camera_to_track(mosse_track, frame.shape, dt)
                     
             if not target_exists:
                 self.motors.move(0, 0)
