@@ -29,11 +29,11 @@ class RocketTracker:
         self.motors = SerialMotorController(motor_port, motor_baud)
         self.motors.run()
 
-        self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", 0.4, None)
+        self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", 1.0, None)
         self.tracker = Tracker(self.metric)
 
         self.pan_pid = PID(2.4, 0.08, 0.18, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
-        self.tilt_pid = PID(2.4, 0.08, 0.18, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
+        self.tilt_pid = PID(4.2, 0.20, 0.28, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
         self.pan, self.tilt = 0.0, 0.0
 
         self.id_to_track = None
@@ -64,7 +64,7 @@ class RocketTracker:
         bboxes = []
         scores = []
         # Classes = [0] for person only
-        results = self.model(frame, conf=0.25, device="mps", verbose=False, classes=[0])[0]
+        results = self.model(frame, conf=0.25, device="mps", verbose=False, classes=[29])[0]
         if results.boxes is not None:
             for box in results.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -149,10 +149,27 @@ class RocketTracker:
         fps = 0.0
 
         ret, frame1 = cap.read()
+        # frame1 = cv2.resize(frame1, YOLO_RESIZE)
         if not ret:
             return
         
         detections = self._get_detections(frame1)
+
+        while len(detections) == 0:
+            cv2.imshow("Select Target", frame1)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+
+            ret, frame1 = cap.read()
+            # frame1 = cv2.resize(frame1, YOLO_RESIZE)
+            if not ret:
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+            
+            detections = self._get_detections(frame1)
 
         if len(detections) == 0:
             return
@@ -187,6 +204,7 @@ class RocketTracker:
 
         while True:
             ret, frame = cap.read()
+            # frame = cv2.resize(frame, YOLO_RESIZE)
             if not ret:
                 break
 
