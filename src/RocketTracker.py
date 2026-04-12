@@ -338,6 +338,7 @@ class RocketTracker:
         input("Press Enter to start tracking...")
 
         ret, frame1 = cap.read()
+        # frame1 = cv2.resize(frame1, YOLO_RESIZE)
         if not ret:
             return
         # frame1 = cv2.resize(frame1, YOLO_RESIZE)  # Resize for consistent processing
@@ -355,6 +356,22 @@ class RocketTracker:
                 cap.release()
                 cv2.destroyAllWindows()
                 return
+
+        while len(detections) == 0:
+            cv2.imshow("Select Target", frame1)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+
+            ret, frame1 = cap.read()
+            # frame1 = cv2.resize(frame1, YOLO_RESIZE)
+            if not ret:
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+            
+            detections = self._get_detections(frame1)
 
         if len(detections) == 0:
             print("No detections found in initial frame, exiting.")
@@ -406,6 +423,7 @@ class RocketTracker:
 
         while True:
             ret, frame = cap.read()
+            # frame = cv2.resize(frame, YOLO_RESIZE)
             if not ret:
                 break
             # frame = cv2.resize(frame, YOLO_RESIZE)  # Resize for consistent processing
@@ -483,6 +501,8 @@ class RocketTracker:
             cv2.imshow("Rocket Tracker", display_frame)
             if self.record_output:
                 out.write(display_frame)
+
+            video_out.write(frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
