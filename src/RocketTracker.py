@@ -24,6 +24,81 @@ fps_smoothing = 0.9
 
 YOLO_RESIZE = (640, 360)
 
+class VelocityEstimator:
+    def __init__(self, fov_x, fov_y, known_width=0.15, alpha=0.7):
+        self.FOV_X = fov_x
+        self.FOV_Y = fov_y
+
+        self.known_width = known_width
+        self.alpha = alpha
+
+        self.prev_center = None
+        self.prev_time = None
+
+        self.vx_smooth = 0.0
+        self.vy_smooth = 0.0
+
+    def reset(self):
+        self.prev_center = None
+        self.prev_time = None
+        self.vx_smooth = 0.0
+        self.vy_smooth = 0.0
+
+    def estimate(self, bbox, frame_shape, pan_rate=0.0, tilt_rate=0.0):
+        x1, y1, x2, y2 = bbox
+
+        obj_x = (x1 + x2) / 2.0
+        obj_y = (y1 + y2) / 2.0
+
+        current_time = time.time()
+
+        if self.prev_center is None:
+            self.prev_center = (obj_x, obj_y)
+            self.prev_time = current_time
+            return None
+
+        dt = np.clip(current_time - self.prev_time, 1e-3, 1.0)
+
+        dx = obj_x - self.prev_center[0]
+        dy = obj_y - self.prev_center[1]
+
+        vx = dx / dt
+        vy = dy / dt
+
+        H, W = frame_shape[:2]
+        px_per_rad_x = W / self.FOV_X
+        px_per_rad_y = H / self.FOV_Y
+
+        cam_vx = pan_rate * px_per_rad_x
+        cam_vy = -tilt_rate * px_per_rad_y
+
+        vx_corr = vx - cam_vx
+        vy_corr = vy - cam_vy
+
+        self.vx_smooth = self.alpha * self.vx_smooth + (1 - self.alpha) * vx_corr
+        self.vy_smooth = self.alpha * self.vy_smooth + (1 - self.alpha) * vy_corr
+
+        speed_px = np.sqrt(self.vx_smooth**2 + self.vy_smooth**2)
+
+        width = float(x2 - x1)
+        scale = self.known_width / width if width > 0 else 0.0
+
+        vx_m = self.vx_smooth * scale
+        vy_m = self.vy_smooth * scale
+        speed_m = np.sqrt(vx_m**2 + vy_m**2)
+
+        self.prev_center = (obj_x, obj_y)
+        self.prev_time = current_time
+
+        return {
+            "vx_px": self.vx_smooth,
+            "vy_px": self.vy_smooth,
+            "speed_px": speed_px,
+            "speed_m": speed_m,
+            "scale": scale
+        }
+
+
 class SimpleBBox:
     """Wrapper for MOSSE bounding box to match track interface."""
     def __init__(self, bbox):
@@ -60,6 +135,8 @@ class RocketTracker:
         # FPS tracking
         self.fps_history = deque(maxlen=100)  # Keep last 100 FPS values
         self.record_output = record_output
+
+        self.velocity_estimator = VelocityEstimator(FOV_X, FOV_Y, known_width=0.3, alpha=0.7)
 
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
@@ -114,9 +191,9 @@ class RocketTracker:
         self.id_to_track = int(input("Enter the tracking ID: "))
 
     def _create_mosse_tracker(self):
-        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
-            return cv2.legacy.TrackerMOSSE_create()
-        return cv2.TrackerMOSSE_create()
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
+            return cv2.legacy.TrackerKCF_create()
+        return cv2.TrackerKCF_create()
 
     def _init_mosse(self, frame, bbox):
         """Initialize MOSSE tracker with initial bounding box."""
@@ -235,6 +312,8 @@ class RocketTracker:
         self.tilt += tilt_rate * dt
         self._command_motors(pan_rate, tilt_rate)
 
+        return pan_rate, tilt_rate
+
     def run(self, camera_index=0):
         try:
             self._run(camera_index)
@@ -254,6 +333,9 @@ class RocketTracker:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 30)
         fps = 0.0
+
+        print(f"Camera size: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
+        input("Press Enter to start tracking...")
 
         ret, frame1 = cap.read()
         if not ret:
@@ -354,7 +436,7 @@ class RocketTracker:
                 for track in self.tracker.tracks:
                     if track.track_id != self.id_to_track:
                         continue
-                    print(f"Updating MOSSE with new detection for track ID {self.id_to_track}")
+                    # print(f"Updating MOSSE with new detection for track ID {self.id_to_track}")
                     target_exists = True
                     x1, y1, x2, y2 = map(int, track.to_tlbr())
                     self._init_mosse(frame, (x1, y1, x2, y2))
@@ -384,10 +466,19 @@ class RocketTracker:
                 target_exists = True
                 mosse_track = SimpleBBox(mosse_bbox)
                 self._display_track(mosse_track, display_frame)
-                self._align_camera_to_track(mosse_track, frame.shape, dt)
+                pan_rate, tilt_rate = self._align_camera_to_track(mosse_track, frame.shape, dt)
                     
+                estimated_velocity = self.velocity_estimator.estimate(mosse_bbox, frame.shape, pan_rate, tilt_rate)
+                if estimated_velocity is not None:
+                    speed_m = estimated_velocity["speed_m"]
+                    cv2.putText(display_frame, f"Speed: {speed_m:.2f} m/s", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    vertical_speed_m = estimated_velocity["vy_px"] * estimated_velocity["scale"]
+                    cv2.putText(display_frame, f"Vertical Speed: {vertical_speed_m:.2f} m/s", (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    horizontal_speed_m = estimated_velocity["vx_px"] * estimated_velocity["scale"]
+                    cv2.putText(display_frame, f"Horizontal Speed: {horizontal_speed_m:.2f} m/s", (10, frame.shape[0] - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2) 
             if not target_exists:
                 self.motors.move(0, 0)
+                self.velocity_estimator.reset()
 
             cv2.imshow("Rocket Tracker", display_frame)
             if self.record_output:
