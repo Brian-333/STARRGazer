@@ -419,7 +419,7 @@ class RocketTracker:
 
         if self.record_output:
             forcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(self.record_output, forcc, 30.0, (frame1.shape[1], frame1.shape[0]))
+            video_out = cv2.VideoWriter(self.record_output, forcc, 30.0, (frame1.shape[1], frame1.shape[0]))
 
         while True:
             ret, frame = cap.read()
@@ -500,15 +500,13 @@ class RocketTracker:
 
             cv2.imshow("Rocket Tracker", display_frame)
             if self.record_output:
-                out.write(display_frame)
-
-            video_out.write(frame)
+                video_out.write(display_frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             
         if self.record_output:
-            out.release()
+            video_out.release()
         self.motors.move(0, 0)
         cap.release()
         time.sleep(0.5)  # Ensure motors receive stop command before closing
