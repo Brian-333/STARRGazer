@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import threading
 import time
+from collections import deque
 
 from deep_sort.deep_sort import nn_matching
 from deep_sort.deep_sort.detection import Detection
@@ -21,6 +22,93 @@ MOTOR_SMOOTHING = 0.25
 TRACKING_GAIN = 3.0
 fps_smoothing = 0.9
 
+YOLO_RESIZE = (640, 360)
+
+# Velocity Estimation Integration Code
+# 1. Added VelocityEstimator class
+class VelocityEstimator:
+    def __init__(self, fov_x, fov_y, known_width=0.15, alpha=0.7):
+        self.FOV_X = fov_x
+        self.FOV_Y = fov_y
+
+        self.known_width = known_width
+        self.alpha = alpha
+
+        self.prev_center = None
+        self.prev_time = None
+
+        self.vx_smooth = 0.0
+        self.vy_smooth = 0.0
+
+    def reset(self):
+        self.prev_center = None
+        self.prev_time = None
+        self.vx_smooth = 0.0
+        self.vy_smooth = 0.0
+
+    def estimate(self, bbox, frame_shape, pan_rate=0.0, tilt_rate=0.0):
+        x1, y1, x2, y2 = bbox
+
+        obj_x = (x1 + x2) / 2.0
+        obj_y = (y1 + y2) / 2.0
+
+        current_time = time.time()
+
+        if self.prev_center is None:
+            self.prev_center = (obj_x, obj_y)
+            self.prev_time = current_time
+            return None
+
+        dt = np.clip(current_time - self.prev_time, 1e-3, 1.0)
+
+        dx = obj_x - self.prev_center[0]
+        dy = obj_y - self.prev_center[1]
+
+        vx = dx / dt
+        vy = dy / dt
+
+        H, W = frame_shape[:2]
+        px_per_rad_x = W / self.FOV_X
+        px_per_rad_y = H / self.FOV_Y
+
+        cam_vx = pan_rate * px_per_rad_x
+        cam_vy = -tilt_rate * px_per_rad_y
+
+        vx_corr = vx - cam_vx
+        vy_corr = vy - cam_vy
+
+        self.vx_smooth = self.alpha * self.vx_smooth + (1 - self.alpha) * vx_corr
+        self.vy_smooth = self.alpha * self.vy_smooth + (1 - self.alpha) * vy_corr
+
+        speed_px = np.sqrt(self.vx_smooth**2 + self.vy_smooth**2)
+
+        width = float(x2 - x1)
+        scale = self.known_width / width if width > 0 else 0.0
+
+        vx_m = self.vx_smooth * scale
+        vy_m = self.vy_smooth * scale
+        speed_m = np.sqrt(vx_m**2 + vy_m**2)
+
+        self.prev_center = (obj_x, obj_y)
+        self.prev_time = current_time
+
+        return {
+            "vx_px": self.vx_smooth,
+            "vy_px": self.vy_smooth,
+            "speed_px": speed_px,
+            "speed_m": speed_m,
+            "scale": scale
+        }
+
+class SimpleBBox:
+    """Wrapper for MOSSE bounding box to match track interface."""
+    def __init__(self, bbox):
+        self.bbox = bbox
+    
+    def to_tlbr(self):
+        """Return bounding box in top-left, bottom-right format."""
+        return self.bbox
+
 class RocketTracker:
     def __init__(self, model, encoder, motor_port, motor_baud):
         self.model = model
@@ -39,14 +127,16 @@ class RocketTracker:
         self.id_to_track = None
         self.filtered_pan_freq = 0.0
         self.filtered_tilt_freq = 0.0
+        
+        # MOSSE tracker for efficient frame-to-frame tracking
+        self.mosse = None
+        self.mosse_bbox = None
+        
+        # FPS tracking
+        self.fps_history = deque(maxlen=100)  # Keep last 100 FPS values
 
-        # New constants needed for tracking:
-        self.prev_center = None
-        self.prev_time = None
-        self.vx_smooth = 0.0
-        self.vy_smooth = 0.0
-        self.vel_alpha = 0.7
-        self.known_width = 0.15
+        # 2) Added velocity estimator initialization
+        self.vel_estimator = VelocityEstimator(FOV_X, FOV_Y)
 
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
@@ -100,20 +190,88 @@ class RocketTracker:
     def _prompt_for_tracking_id(self):
         self.id_to_track = int(input("Enter the tracking ID: "))
 
+    def _init_mosse(self, frame, bbox):
+        """Initialize MOSSE tracker with initial bounding box."""
+        x1, y1, x2, y2 = map(int, bbox)
+        self.mosse = cv2.legacy.TrackerMOSSE_create()
+        self.mosse.init(frame, (x1, y1, x2 - x1, y2 - y1))
+        self.mosse_bbox = bbox
+
+    def _update_mosse(self, frame):
+        """Update MOSSE tracker and return new bounding box."""
+        if self.mosse is None:
+            return None
+        
+        success, bbox = self.mosse.update(frame)
+        if success:
+            x, y, w, h = bbox
+            self.mosse_bbox = (x, y, x + w, y + h)
+            return self.mosse_bbox
+        return None
+
+    def _draw_fps_plot(self, frame, fps):
+        """Draw FPS history plot on the frame."""
+        self.fps_history.append(fps)
+        
+        # Plot dimensions
+        plot_width = 200
+        plot_height = 100
+        plot_x = frame.shape[1] - plot_width - 10
+        plot_y = 10
+        
+        # Background
+        cv2.rectangle(frame, (plot_x, plot_y), (plot_x + plot_width, plot_y + plot_height), (0, 0, 0), -1)
+        cv2.rectangle(frame, (plot_x, plot_y), (plot_x + plot_width, plot_y + plot_height), (255, 255, 255), 1)
+        
+        # Draw grid lines
+        cv2.line(frame, (plot_x, plot_y + plot_height // 2), (plot_x + plot_width, plot_y + plot_height // 2), (100, 100, 100), 1)
+        
+        # Draw FPS values as line graph
+        if len(self.fps_history) > 1:
+            max_fps = 60  # Reference max FPS
+            for i in range(len(self.fps_history) - 1):
+                x1 = plot_x + int((i / len(self.fps_history)) * plot_width)
+                y1 = plot_y + plot_height - int((self.fps_history[i] / max_fps) * plot_height)
+                x2 = plot_x + int(((i + 1) / len(self.fps_history)) * plot_width)
+                y2 = plot_y + plot_height - int((self.fps_history[i + 1] / max_fps) * plot_height)
+                
+                # Clamp y values
+                y1 = np.clip(y1, plot_y, plot_y + plot_height)
+                y2 = np.clip(y2, plot_y, plot_y + plot_height)
+                
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        # Display current FPS and label
+        cv2.putText(frame, f"FPS: {fps:.1f}", (plot_x + 5, plot_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
     def _display_track(self, track, frame):
         x1, y1, x2, y2 = map(int, track.to_tlbr())
-        track_id = track.track_id
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(
-            frame,
-            f"ID: {track_id}",
-            (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-        )
+        
+        # Display track_id if available (from deep sort tracks)
+        if hasattr(track, 'track_id'):
+            track_id = track.track_id
+            cv2.putText(
+                frame,
+                f"ID: {track_id}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+            )
+        else:
+            # MOSSE tracker
+            cv2.putText(
+                frame,
+                f"ID: {self.id_to_track} (MOSSE)",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+            )
 
     def _align_camera_to_track(self, target_track, frame_shape, dt):
         frame_height, frame_width = frame_shape[:2]
@@ -146,86 +304,30 @@ class RocketTracker:
         self.pan += pan_rate * dt
         self.tilt += tilt_rate * dt
         self._command_motors(pan_rate, tilt_rate)
-        # New: Now returning both rates to use in the velocity estimation
+
+        #3) Velocity estimation needs pan_rate and tilt_rate to correct for camera motion
         return pan_rate, tilt_rate
 
-    # ----------------------------------------------------------------
-    # New-untested velocity estimation
-    def _estimate_velocity(self, track, frame_shape, pan_rate, tilt_rate):
-        x1, y1, x2, y2 = map(int, track.to_tlbr())
-        obj_x = (x1 + x2) / 2.0
-        obj_y = (y1 + y2) / 2.0
-
-        current_time = time.time()
-        if self.prev_center is None:
-            self.prev_center = (obj_x, obj_y)
-            self.prev_time = current_time
-            return {
-                "vx_px": 0.0,
-                "vy_px": 0.0,
-                "speed_px": 0.0,
-                "speed_m": 0.0,
-                "pixel_to_meter": 0.0,
-            }
-
-        dt_vel = np.clip(current_time - self.prev_time, 1e-3, 1.0)
-        dx = obj_x - self.prev_center[0]
-        dy = obj_y - self.prev_center[1]
-
-        vx = dx / dt_vel
-        vy = dy / dt_vel
-
-        frame_height, frame_width = frame_shape[:2]
-        px_per_rad_x = frame_width / FOV_X
-        px_per_rad_y = frame_height / FOV_Y
-
-        cam_vx = pan_rate * px_per_rad_x
-        cam_vy = -tilt_rate * px_per_rad_y
-
-        vx_corrected = vx - cam_vx
-        vy_corrected = vy - cam_vy
-
-        self.vx_smooth = self.vel_alpha * self.vx_smooth + (1.0 - self.vel_alpha) * vx_corrected
-        self.vy_smooth = self.vel_alpha * self.vy_smooth + (1.0 - self.vel_alpha) * vy_corrected
-
-        speed_px = np.sqrt(self.vx_smooth**2 + self.vy_smooth**2)
-        width = float(x2 - x1)
-        pixel_to_meter = self.known_width / width if width > 0 else 0.0
-        vx_m = self.vx_smooth * pixel_to_meter
-        vy_m = self.vy_smooth * pixel_to_meter
-        speed_m = np.sqrt(vx_m**2 + vy_m**2)
-
-        self.prev_center = (obj_x, obj_y)
-        self.prev_time = current_time
-
-        return {
-            "vx_px": self.vx_smooth,
-            "vy_px": self.vy_smooth,
-            "speed_px": speed_px,
-            "speed_m": speed_m,
-            "pixel_to_meter": pixel_to_meter,
-        }
-    # New display of velocity
-    def _display_velocity(self, frame, velocity):
-        cv2.putText(frame, f"vx: {velocity['vx_px']:.1f} px/s", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"vy: {velocity['vy_px']:.1f} px/s", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"speed: {velocity['speed_px']:.1f} px/s", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Speed: {velocity['speed_m']:.2f} m/s", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, f"scale: {velocity['pixel_to_meter']:.4f} m/px", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     def run(self, camera_index=0):
         if self.motors is None:
             return
 
         cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            print(f"ERROR: Could not open camera at index {camera_index}")
+            return
+
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 30)
         fps = 0.0
 
         ret, frame1 = cap.read()
-        if not ret:
+        if not ret or frame1 is None:
+            print(f"ERROR: Camera frame read failed for index {camera_index}")
             return
-        
+
+        frame1 = cv2.resize(frame1, YOLO_RESIZE)  # Resize for consistent processing
         detections = self._get_detections(frame1)
 
         if len(detections) == 0:
@@ -254,58 +356,103 @@ class RocketTracker:
 
         print(f"Selected tracking ID: {self.id_to_track}")
 
-        frames_to_skip = 5
+        # Initialize MOSSE tracker with the selected target
+        for track in self.tracker.tracks:
+            if track.track_id == self.id_to_track:
+                x1, y1, x2, y2 = map(int, track.to_tlbr())
+                self._init_mosse(frame1, (x1, y1, x2, y2))
+                break
+
+        frames_to_skip = 10  # Run YOLO every 10 frames, use MOSSE for others
         frame_count = 0
 
         last_time = time.time()
 
         while True:
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
+                print("ERROR: Camera frame read failed during tracking loop")
                 break
+
+            frame = cv2.resize(frame, YOLO_RESIZE)  # Resize for consistent processing
 
             now = time.time()
             dt = now - last_time
             last_time = now
             current_fps = 1.0 / dt
             fps = fps_smoothing * fps + (1 - fps_smoothing) * current_fps
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.2f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2,
-            )
+            
+            # Draw FPS plot on frame
+            self._draw_fps_plot(frame, current_fps)
 
-            self.tracker.predict()
+            # Update MOSSE tracker every frame
+            mosse_bbox = self._update_mosse(frame)
+            
+            # Run YOLO detections periodically
             frame_count += 1
             if frame_count % frames_to_skip == 0:
+                self.tracker.predict()
                 detections = self._get_detections(frame)
-
                 self.tracker.update(detections)
                 frame_count = 0
 
-            target_exists = False
-            for track in self.tracker.tracks:
-                if track.track_id != self.id_to_track:
-                    continue
-                
-                target_exists = True
-                self._display_track(track, frame)
+                # Update MOSSE with new detection from YOLO
+                target_exists = False
+                for track in self.tracker.tracks:
+                    if track.track_id != self.id_to_track:
+                        continue
+                    target_exists = True
+                    x1, y1, x2, y2 = map(int, track.to_tlbr())
+                    self._init_mosse(frame, (x1, y1, x2, y2))
+                    mosse_bbox = (x1, y1, x2, y2)
+                    break
+            else:
+                self.tracker.predict()
+                if mosse_bbox is not None:
+                    mosse_w = mosse_bbox[2] - mosse_bbox[0]
+                    mosse_h = mosse_bbox[3] - mosse_bbox[1]
+                    mosse_bbox_det = [mosse_bbox[0], mosse_bbox[1], mosse_w, mosse_h]
+                    features = self.encoder(frame, [mosse_bbox_det])
+                    self.tracker.update([Detection(mosse_bbox_det, 1.0, features[0])])
 
-                # New velocity calls
-                pan_rate, tilt_rate = self._align_camera_to_track(track, frame.shape, dt)
-                velocity = self._estimate_velocity(track, frame.shape, pan_rate, tilt_rate)
-                self._display_velocity(frame, velocity)
+            # Use MOSSE bbox for tracking and alignment
+            target_exists = False
+            
+            # --------------------------------------------------------------------
+            # 4) Velocity estimation integration - pass pan_rate and tilt_rate to estimator
+
+            if mosse_bbox is not None:
+                target_exists = True
+                mosse_track = SimpleBBox(mosse_bbox)
+                self._display_track(mosse_track, frame)
+
+                pan_rate, tilt_rate = self._align_camera_to_track(
+                    mosse_track, frame.shape, dt
+                )
+
+                velocity = self.vel_estimator.estimate(
+                    mosse_bbox,
+                    frame.shape,
+                    pan_rate,
+                    tilt_rate
+                )
+
+                if velocity is not None:
+                    cv2.putText(frame, f"vx: {velocity['vx_px']:.1f}", (10, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    cv2.putText(frame, f"vy: {velocity['vy_px']:.1f}", (10, 65),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    cv2.putText(frame, f"speed: {velocity['speed_px']:.1f}px/s", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    cv2.putText(frame, f"{velocity['speed_m']:.2f} m/s", (10, 115),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
                     
+            # --------------------------------------------------------------------
+
+            # 5) Reset when target is lost
+
             if not target_exists:
-                # reset velocity constants
-                self.prev_center = None
-                self.prev_time = None
-                self.vx_smooth = 0.0
-                self.vy_smooth = 0.0
+                self.vel_estimator.reset()  # Reset velocity estimator when target is lost
                 self.motors.move(0, 0)
 
             cv2.imshow("Rocket Tracker", frame)
@@ -313,7 +460,9 @@ class RocketTracker:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        cap.release()
         self.motors.move(0, 0)
+        cap.release()
+        time.sleep(0.5)  # Ensure motors receive stop command before closing
         self.motors.close()
         cv2.destroyAllWindows()
+        
