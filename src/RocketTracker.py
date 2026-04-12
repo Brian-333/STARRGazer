@@ -34,18 +34,19 @@ class SimpleBBox:
         return self.bbox
 
 class RocketTracker:
-    def __init__(self, model, encoder, motor_port, motor_baud):
+    def __init__(self, model, encoder, motor_port, motor_baud, record_output=None, classes=[0]):
         self.model = model
         self.encoder = encoder
+        self.classes = classes
 
         self.motors = SerialMotorController(motor_port, motor_baud)
         self.motors.run()
 
-        self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", 0.4, None)
+        self.metric = nn_matching.NearestNeighborDistanceMetric("cosine", 0.8, None)
         self.tracker = Tracker(self.metric)
 
-        self.pan_pid = PID(2.4, 0.08, 0.18, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
-        self.tilt_pid = PID(2.4, 0.08, 0.18, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
+        self.pan_pid = PID(3, 0.18, 0.28, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
+        self.tilt_pid = PID(3.8, 0.23, 0.55, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
         self.pan, self.tilt = 0.0, 0.0
 
         self.id_to_track = None
@@ -58,6 +59,7 @@ class RocketTracker:
         
         # FPS tracking
         self.fps_history = deque(maxlen=100)  # Keep last 100 FPS values
+        self.record_output = record_output
 
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
@@ -83,7 +85,7 @@ class RocketTracker:
         bboxes = []
         scores = []
         # Classes = [0] for person only
-        results = self.model(frame, conf=0.25, device="mps", verbose=False)[0]
+        results = self.model(frame, conf=0.25, device="mps", verbose=False, classes=self.classes)[0]
         if results.boxes is not None:
             for box in results.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -111,11 +113,16 @@ class RocketTracker:
     def _prompt_for_tracking_id(self):
         self.id_to_track = int(input("Enter the tracking ID: "))
 
+    def _create_mosse_tracker(self):
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
+            return cv2.legacy.TrackerMOSSE_create()
+        return cv2.TrackerMOSSE_create()
+
     def _init_mosse(self, frame, bbox):
         """Initialize MOSSE tracker with initial bounding box."""
         x1, y1, x2, y2 = map(int, bbox)
-        self.mosse = cv2.legacy.TrackerMOSSE_create()
-        self.mosse.init(frame, (x1, y1, x2 - x1, y2 - y1))
+        self.mosse = self._create_mosse_tracker()
+        self.mosse.init(frame, (max(x1, 0), max(y1, 0), max(x2 - x1, 0), max(y2 - y1, 0)))
         self.mosse_bbox = bbox
 
     def _update_mosse(self, frame):
@@ -128,6 +135,8 @@ class RocketTracker:
             x, y, w, h = bbox
             self.mosse_bbox = (x, y, x + w, y + h)
             return self.mosse_bbox
+
+        self.mosse = None
         return None
 
     def _draw_fps_plot(self, frame, fps):
@@ -227,6 +236,17 @@ class RocketTracker:
         self._command_motors(pan_rate, tilt_rate)
 
     def run(self, camera_index=0):
+        try:
+            self._run(camera_index)
+        except KeyboardInterrupt:
+            print("Exiting...")
+        finally:
+            if self.motors is not None:
+                self.motors.move(0, 0)
+                time.sleep(0.5)  # Ensure motors receive stop command before closing
+                self.motors.close()
+
+    def _run(self, camera_index=0):
         if self.motors is None:
             return
 
@@ -236,37 +256,55 @@ class RocketTracker:
         fps = 0.0
 
         ret, frame1 = cap.read()
-        frame1 = cv2.resize(frame1, YOLO_RESIZE)  # Resize for consistent processing
         if not ret:
             return
+        # frame1 = cv2.resize(frame1, YOLO_RESIZE)  # Resize for consistent processing
         
         detections = self._get_detections(frame1)
+        while len(detections) == 0:
+            try:
+                ret, frame1 = cap.read()
+                if not ret:
+                    return
+                # frame1 = cv2.resize(frame1, YOLO_RESIZE)  # Resize for consistent processing
+                detections = self._get_detections(frame1)
+            except KeyboardInterrupt:
+                print("Exiting...")
+                cap.release()
+                cv2.destroyAllWindows()
+                return
 
         if len(detections) == 0:
+            print("No detections found in initial frame, exiting.")
             return
 
         self.tracker.predict()
         self.tracker.update(detections)
 
-        for track in self.tracker.tracks:
-            if track.time_since_update > 1:
-                continue
+        if len(self.tracker.tracks) == 1:
+            self.id_to_track = 1
+            print("Only one track detected, automatically selecting it.")
+        else:
 
-            self._display_track(track, frame1)
+            for track in self.tracker.tracks:
+                if track.time_since_update > 1:
+                    continue
 
-        prompt_thread = threading.Thread(target=self._prompt_for_tracking_id, daemon=True)
-        prompt_thread.start()
+                self._display_track(track, frame1)
 
-        cv2.imshow("Select Target", frame1)
-        while prompt_thread.is_alive():
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            prompt_thread = threading.Thread(target=self._prompt_for_tracking_id, daemon=True)
+            prompt_thread.start()
 
-        prompt_thread.join()
-        
-        cv2.destroyAllWindows()
+            cv2.imshow("Select Target", frame1)
+            while prompt_thread.is_alive():
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
-        print(f"Selected tracking ID: {self.id_to_track}")
+            prompt_thread.join()
+            
+            cv2.destroyAllWindows()
+
+            print(f"Selected tracking ID: {self.id_to_track}")
 
         # Initialize MOSSE tracker with the selected target
         for track in self.tracker.tracks:
@@ -275,16 +313,21 @@ class RocketTracker:
                 self._init_mosse(frame1, (x1, y1, x2, y2))
                 break
 
-        frames_to_skip = 10  # Run YOLO every 10 frames, use MOSSE for others
+        frames_to_skip = 10 # Run YOLO every 10 frames, use MOSSE for others
         frame_count = 0
 
         last_time = time.time()
 
+        if self.record_output:
+            forcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(self.record_output, forcc, 30.0, (frame1.shape[1], frame1.shape[0]))
+
         while True:
             ret, frame = cap.read()
-            frame = cv2.resize(frame, YOLO_RESIZE)  # Resize for consistent processing
             if not ret:
                 break
+            # frame = cv2.resize(frame, YOLO_RESIZE)  # Resize for consistent processing
+            display_frame = frame.copy()
 
             now = time.time()
             dt = now - last_time
@@ -293,7 +336,7 @@ class RocketTracker:
             fps = fps_smoothing * fps + (1 - fps_smoothing) * current_fps
             
             # Draw FPS plot on frame
-            self._draw_fps_plot(frame, current_fps)
+            self._draw_fps_plot(display_frame, current_fps)
 
             # Update MOSSE tracker every frame
             mosse_bbox = self._update_mosse(frame)
@@ -311,6 +354,7 @@ class RocketTracker:
                 for track in self.tracker.tracks:
                     if track.track_id != self.id_to_track:
                         continue
+                    print(f"Updating MOSSE with new detection for track ID {self.id_to_track}")
                     target_exists = True
                     x1, y1, x2, y2 = map(int, track.to_tlbr())
                     self._init_mosse(frame, (x1, y1, x2, y2))
@@ -325,22 +369,35 @@ class RocketTracker:
                     features = self.encoder(frame, [mosse_bbox_det])
                     self.tracker.update([Detection(mosse_bbox_det, 1.0, features[0])])
 
+            if mosse_bbox is None:
+                for track in self.tracker.tracks:
+                    if track.track_id != self.id_to_track or track.time_since_update > 1:
+                        continue
+                    x1, y1, x2, y2 = map(int, track.to_tlbr())
+                    mosse_bbox = (x1, y1, x2, y2)
+                    self._init_mosse(frame, mosse_bbox)
+                    break
+
             # Use MOSSE bbox for tracking and alignment
             target_exists = False
             if mosse_bbox is not None:
                 target_exists = True
                 mosse_track = SimpleBBox(mosse_bbox)
-                self._display_track(mosse_track, frame)
+                self._display_track(mosse_track, display_frame)
                 self._align_camera_to_track(mosse_track, frame.shape, dt)
                     
             if not target_exists:
                 self.motors.move(0, 0)
 
-            cv2.imshow("Rocket Tracker", frame)
+            cv2.imshow("Rocket Tracker", display_frame)
+            if self.record_output:
+                out.write(display_frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
+            
+        if self.record_output:
+            out.release()
         self.motors.move(0, 0)
         cap.release()
         time.sleep(0.5)  # Ensure motors receive stop command before closing

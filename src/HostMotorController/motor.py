@@ -114,7 +114,7 @@ if __name__ == "__main__":
         if multithreaded:
             motors.move(*command)
         else:
-            motors.send_msg(f"move {command[0]} {command[1]}\r\n".encode())
+            motors.send_msg(f"{command[0]} {command[1]}\r\n".encode())
         time.sleep(1)
 
     if multithreaded:
