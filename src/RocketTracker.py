@@ -77,7 +77,7 @@ class RocketTracker:
         if abs(self.filtered_tilt_freq) < 0.5:
             self.filtered_tilt_freq = 0.0
 
-        # self.motors.move(self.filtered_pan_freq, self.filtered_tilt_freq)
+        self.motors.move(self.filtered_pan_freq, self.filtered_tilt_freq)
 
     def _get_detections(self, frame):
         bboxes = []
