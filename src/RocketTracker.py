@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 import threading
 import time
+import csv
+from pathlib import Path
 from collections import deque
 
 from deep_sort.deep_sort import nn_matching
@@ -109,7 +111,7 @@ class SimpleBBox:
         return self.bbox
 
 class RocketTracker:
-    def __init__(self, model, encoder, motor_port, motor_baud, record_output=None, classes=[0]):
+    def __init__(self, model, encoder, motor_port, motor_baud, record_output=None, fps_csv_output=None, classes=None):
         self.model = model
         self.encoder = encoder
         self.classes = classes
@@ -121,7 +123,7 @@ class RocketTracker:
         self.tracker = Tracker(self.metric)
 
         self.pan_pid = PID(3, 0.18, 0.28, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
-        self.tilt_pid = PID(3.8, 0.23, 0.55, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
+        self.tilt_pid = PID(3.8, 0.15, 0.45, integral_limit=np.deg2rad(12), output_limit=np.deg2rad(120))
         self.pan, self.tilt = 0.0, 0.0
 
         self.id_to_track = None
@@ -135,8 +137,31 @@ class RocketTracker:
         # FPS tracking
         self.fps_history = deque(maxlen=100)  # Keep last 100 FPS values
         self.record_output = record_output
+        self.fps_csv_output = fps_csv_output
+        self._fps_csv_file = None
+        self._fps_csv_writer = None
 
         self.velocity_estimator = VelocityEstimator(FOV_X, FOV_Y, known_width=0.3, alpha=0.7)
+
+    def _open_fps_csv(self):
+        if self.fps_csv_output is None and self.record_output:
+            output_path = Path(self.record_output)
+            self.fps_csv_output = str(output_path.with_suffix("")) + "_fps.csv"
+
+        if not self.fps_csv_output:
+            return
+
+        csv_path = Path(self.fps_csv_output)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fps_csv_file = open(csv_path, "w", newline="")
+        self._fps_csv_writer = csv.writer(self._fps_csv_file)
+        self._fps_csv_writer.writerow(["timestamp", "frame_index", "fps_raw", "fps_smoothed"])
+
+    def _close_fps_csv(self):
+        if self._fps_csv_file is not None:
+            self._fps_csv_file.close()
+            self._fps_csv_file = None
+            self._fps_csv_writer = None
 
     def _command_motors(self, pan_rate, tilt_rate):
         # Map angular rate (rad/s) to board frequency command.
@@ -198,6 +223,13 @@ class RocketTracker:
     def _init_mosse(self, frame, bbox):
         """Initialize MOSSE tracker with initial bounding box."""
         x1, y1, x2, y2 = map(int, bbox)
+        # Check if bbox is valid and within frame bounds
+        if x1 < 0 or y1 < 0 or x2 > frame.shape[1] or y2 > frame.shape[0]:
+            x1 = max(0, min(frame.shape[1] - 1, x1))
+            y1 = max(0, min(frame.shape[0] - 1, y1))
+            x2 = max(0, min(frame.shape[1], x2))
+            y2 = max(0, min(frame.shape[0], y2))
+
         self.mosse = self._create_mosse_tracker()
         self.mosse.init(frame, (max(x1, 0), max(y1, 0), max(x2 - x1, 0), max(y2 - y1, 0)))
         self.mosse_bbox = bbox
@@ -255,30 +287,6 @@ class RocketTracker:
         x1, y1, x2, y2 = map(int, track.to_tlbr())
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        
-        # Display track_id if available (from deep sort tracks)
-        if hasattr(track, 'track_id'):
-            track_id = track.track_id
-            cv2.putText(
-                frame,
-                f"ID: {track_id}",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-            )
-        else:
-            # MOSSE tracker
-            cv2.putText(
-                frame,
-                f"ID: {self.id_to_track} (MOSSE)",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-            )
 
     def _align_camera_to_track(self, target_track, frame_shape, dt):
         frame_height, frame_width = frame_shape[:2]
@@ -324,6 +332,8 @@ class RocketTracker:
                 self.motors.move(0, 0)
                 time.sleep(0.5)  # Ensure motors receive stop command before closing
                 self.motors.close()
+            self._close_fps_csv()
+            cv2.destroyAllWindows()
 
     def _run(self, camera_index=0):
         if self.motors is None:
@@ -419,7 +429,10 @@ class RocketTracker:
 
         if self.record_output:
             forcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video_out = cv2.VideoWriter(self.record_output, forcc, 30.0, (frame1.shape[1], frame1.shape[0]))
+            video_out = cv2.VideoWriter(self.record_output, forcc, 28.0, (frame1.shape[1], frame1.shape[0]))
+
+        self._open_fps_csv()
+        total_frame_index = 0
 
         while True:
             ret, frame = cap.read()
@@ -434,6 +447,12 @@ class RocketTracker:
             last_time = now
             current_fps = 1.0 / dt
             fps = fps_smoothing * fps + (1 - fps_smoothing) * current_fps
+            total_frame_index += 1
+
+            if self._fps_csv_writer is not None:
+                self._fps_csv_writer.writerow([now, total_frame_index, current_fps, fps])
+                if total_frame_index % 30 == 0:
+                    self._fps_csv_file.flush()
             
             # Draw FPS plot on frame
             self._draw_fps_plot(display_frame, current_fps)
